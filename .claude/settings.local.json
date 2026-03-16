@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -m pytest tests/test_var1.py tests/test_metrics.py -x -v)",
+      "Bash(python -m pytest tests/test_wasserstein.py tests/test_calibration.py -x -v)",
+      "Bash(python -m pytest tests/test_neural_ot.py -x -v)"
+    ]
+  }
+}

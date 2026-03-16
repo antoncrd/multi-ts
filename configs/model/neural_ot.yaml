@@ -1,0 +1,13 @@
+name: neural_ot
+icnn:
+  hidden_dims: [128, 128, 128, 64]
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+inverse:
+  hidden_dims: [256, 256, 128]
+  lr: 1.0e-3
+n_epochs: 500
+batch_size: 256
+monge_gap_weight: 0.1
+grad_clip: 1.0
+warmup_epochs: 50

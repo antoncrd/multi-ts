@@ -1,0 +1,18 @@
+defaults:
+  - dgp: var1
+  - model: neural_ot
+  - conformal: default
+  - _self_
+
+seed: 42
+n_train: 1000
+n_test: 500
+alpha: 0.1
+beta: 0.05
+device: cuda
+output_dir: results/${dgp.name}/${now:%Y-%m-%d_%H-%M-%S}
+
+hydra:
+  sweep:
+    dir: results/sweep/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: d${dgp.d}_rhoA${dgp.rho_A}_k${conformal.k}

@@ -1,0 +1,3 @@
+k: 500  # calibration set size
+w1_method: auto  # exact, sliced, or auto
+w1_n_projections: 100  # for sliced Wasserstein

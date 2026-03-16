@@ -1,0 +1,5 @@
+name: heavytail
+d: 8
+rho_A: 0.5
+rho_cross: 0.3
+nu: 5  # Student-t degrees of freedom (3, 5, 10, or null for Gaussian)
