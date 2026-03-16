@@ -1,13 +1,14 @@
 """Neural Optimal Transport via Input-Convex Neural Networks (ICNN).
 
 Implements:
-- ICNN: Input-Convex Neural Network for the OT potential
-- Forward map Q_hat: gradient of the ICNN potential
+- ICNN: Input-Convex Neural Network for the OT potential phi
+- Forward map Q_hat = nabla phi: pushes residuals -> B_d(0,1)
 - AmortizedInverse: MLP trained to invert Q_hat
-- NeuralOTMap: combines forward + inverse, with Monge gap training
+- NeuralOTMap: trains via W2 semi-dual with target U(B_d),
+  with strong convexity and ball confinement penalties.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -16,6 +17,67 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange
 
+
+# ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+def sample_uniform_ball(n: int, d: int, device: torch.device) -> torch.Tensor:
+    """Sample n points uniformly from the d-dimensional unit ball B_d(0,1).
+
+    Method: sample direction uniformly on S^{d-1}, then radius r ~ U^{1/d}.
+    """
+    z = torch.randn(n, d, device=device)
+    z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    u = torch.rand(n, 1, device=device)
+    r = u.pow(1.0 / d)
+    return r * z
+
+
+def differentiable_sliced_wasserstein(
+    X: torch.Tensor, Y: torch.Tensor, n_projections: int = 50
+) -> torch.Tensor:
+    """Differentiable Sliced Wasserstein distance (squared) between two sets.
+
+    SW_2^2(X, Y) = E_theta[ W_2^2(X.theta, Y.theta) ]
+
+    where theta is a random direction on S^{d-1} and W_2^2 on 1D
+    sorted samples is ||sort(X.theta) - sort(Y.theta)||^2.
+
+    Both X and Y must have the same number of samples.
+    torch.sort is differentiable, so this is end-to-end differentiable.
+
+    Args:
+        X: (n, d) source samples (output of Q_hat, requires grad).
+        Y: (n, d) target samples (from U(B_d), no grad needed).
+        n_projections: number of random directions.
+
+    Returns:
+        Scalar SW_2^2 loss.
+    """
+    d = X.shape[1]
+    device = X.device
+
+    # Random directions on S^{d-1}
+    theta = torch.randn(n_projections, d, device=device)
+    theta = theta / theta.norm(dim=1, keepdim=True)
+
+    # Project: (n_projections, n)
+    proj_X = X @ theta.T  # (n, n_proj) -> transpose to (n_proj, n) below
+    proj_Y = Y @ theta.T
+
+    # Sort along sample dimension
+    proj_X_sorted = torch.sort(proj_X, dim=0).values  # (n, n_proj)
+    proj_Y_sorted = torch.sort(proj_Y, dim=0).values
+
+    # W_2^2 per projection: mean of squared differences
+    sw2 = ((proj_X_sorted - proj_Y_sorted) ** 2).mean()
+    return sw2
+
+
+# ---------------------------------------------------------------------------
+# ICNN
+# ---------------------------------------------------------------------------
 
 class ICNN(nn.Module):
     """Input-Convex Neural Network.
@@ -27,7 +89,12 @@ class ICNN(nn.Module):
     The OT map is Q_hat(x) = nabla_x phi(x).
     """
 
-    def __init__(self, input_dim: int, hidden_dims: Optional[List[int]] = None):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Optional[List[int]] = None,
+        strong_convexity: float = 0.1,
+    ):
         super().__init__()
         if hidden_dims is None:
             hidden_dims = [128, 128, 128, 64] if input_dim <= 16 else [256, 256, 128, 64]
@@ -62,48 +129,27 @@ class ICNN(nn.Module):
         self.wx_out = nn.Linear(input_dim, 1, bias=False)
         self.bias_out = nn.Parameter(torch.zeros(1))
 
-        # Add a quadratic term for strong convexity: (epsilon/2)||x||^2
-        self.strong_convexity = 0.1
+        # Strong convexity: phi(x) += (epsilon/2)||x||^2
+        # ensures nabla^2 phi >= epsilon I, making Q_hat a diffeomorphism
+        self.strong_convexity = strong_convexity
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute the convex potential phi(x).
-
-        Args:
-            x: shape (batch, input_dim).
-
-        Returns:
-            Scalar potential, shape (batch, 1).
-        """
-        # First hidden layer
+        """Compute the convex potential phi(x). Shape (batch, 1)."""
         z = F.softplus(self.wx_layers[0](x) + self.biases[0])
 
-        # Subsequent hidden layers with non-negative W_z
         for i, wz_raw in enumerate(self.wz_raw[:-1]):
-            wz = F.softplus(wz_raw)  # Enforce non-negativity
+            wz = F.softplus(wz_raw)
             z = F.softplus(
                 F.linear(z, wz) + self.wx_layers[i + 1](x) + self.biases[i + 1]
             )
 
-        # Output layer
         wz_out = F.softplus(self.wz_raw[-1])
         phi = F.linear(z, wz_out) + self.wx_out(x) + self.bias_out
-
-        # Add strong convexity term
         phi = phi + 0.5 * self.strong_convexity * (x ** 2).sum(dim=1, keepdim=True)
-
         return phi
 
     def gradient(self, x: torch.Tensor, create_graph: bool = False) -> torch.Tensor:
-        """Compute nabla_x phi(x) = the OT map Q_hat(x).
-
-        Args:
-            x: shape (batch, input_dim).
-            create_graph: If True, the graph of the gradient is constructed,
-                allowing higher-order gradients and backprop through the map.
-
-        Returns:
-            Gradient, shape (batch, input_dim).
-        """
+        """Compute nabla_x phi(x) = Q_hat(x). Shape (batch, input_dim)."""
         x_in = x.detach().clone().requires_grad_(True)
         phi = self.forward(x_in)
         grad = torch.autograd.grad(
@@ -115,11 +161,12 @@ class ICNN(nn.Module):
         return grad
 
 
-class AmortizedInverse(nn.Module):
-    """MLP trained to approximate the inverse of the ICNN gradient map.
+# ---------------------------------------------------------------------------
+# Amortized inverse
+# ---------------------------------------------------------------------------
 
-    R_hat(y) ≈ Q_hat^{-1}(y) such that R_hat(Q_hat(x)) ≈ x.
-    """
+class AmortizedInverse(nn.Module):
+    """MLP trained to approximate Q_hat^{-1}: B_d -> residual space."""
 
     def __init__(self, dim: int, hidden_dims: Optional[List[int]] = None):
         super().__init__()
@@ -138,12 +185,22 @@ class AmortizedInverse(nn.Module):
         return self.net(y)
 
 
-class NeuralOTMap:
-    """Neural OT map combining ICNN forward map and amortized inverse.
+# ---------------------------------------------------------------------------
+# NeuralOTMap
+# ---------------------------------------------------------------------------
 
-    Training procedure:
-    1. Train ICNN potential with Monge gap regularization
-    2. Train inverse MLP to invert the forward map
+class NeuralOTMap:
+    """Neural OT map: residuals -> B_d(0,1) via ICNN Brenier potential.
+
+    Training uses the W2 semi-dual of Kantorovich:
+        max_{phi convex} E_mu[phi(x)] + E_nu[phi*(y)]
+    where nu = U(B_d) and phi*(y) = sup_z {<y,z> - phi(z)}.
+
+    The gradient nabla phi is the OT map Q_hat pushing mu to nu.
+
+    Additional losses:
+    - Ball confinement: lambda_ball * E[ReLU(||Q(x)|| - 1)^2]
+    - Monge cost monitor: E[||x - Q(x)||^2] (not optimized, just logged)
     """
 
     def __init__(
@@ -159,12 +216,15 @@ class NeuralOTMap:
         monge_gap_weight: float = 0.1,
         grad_clip: float = 1.0,
         warmup_epochs: int = 50,
+        strong_convexity: float = 0.1,
+        ball_penalty_weight: float = 10.0,
+        n_conjugate_candidates: int = 512,
         device: str = "cpu",
     ):
         self.device = torch.device(device)
         self.input_dim = input_dim
 
-        self.icnn = ICNN(input_dim, hidden_dims_icnn).to(self.device)
+        self.icnn = ICNN(input_dim, hidden_dims_icnn, strong_convexity).to(self.device)
         self.inverse = AmortizedInverse(input_dim, hidden_dims_inverse).to(self.device)
 
         self.lr_icnn = lr_icnn
@@ -175,6 +235,23 @@ class NeuralOTMap:
         self.monge_gap_weight = monge_gap_weight
         self.grad_clip = grad_clip
         self.warmup_epochs = warmup_epochs
+        self.ball_penalty_weight = ball_penalty_weight
+        self.n_conjugate_candidates = n_conjugate_candidates
+
+        # Normalization parameters (set during fit)
+        self._source_mean: Optional[torch.Tensor] = None
+        self._source_std: Optional[torch.Tensor] = None
+        # Post-hoc output normalization: Q_norm(x) = Q(x) / _output_scale
+        # so that max(||Q_norm(x)||) <= 1 over training data
+        self._output_scale: float = 1.0
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize input using stored mean/std."""
+        return (x - self._source_mean) / self._source_std
+
+    def _denormalize(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalize."""
+        return x_norm * self._source_std + self._source_mean
 
     def fit(
         self,
@@ -184,32 +261,47 @@ class NeuralOTMap:
     ) -> Dict[str, list]:
         """Train the neural OT map.
 
-        If target_samples is None, uses standard normal as target.
+        If target_samples is None, target is U(B_d).
+
+        Residuals are z-score normalized internally so that the ICNN
+        operates on O(1)-magnitude inputs, making it feasible for
+        nabla phi to output vectors within B_d.
 
         Args:
-            source_samples: shape (n, d), source distribution samples (residuals).
-            target_samples: shape (n, d), target distribution samples.
+            source_samples: shape (n, d), source distribution (residuals).
+            target_samples: shape (n, d), optional explicit target samples.
             verbose: Show progress bar.
 
         Returns:
             Dict with training loss histories.
         """
-        d = source_samples.shape[1]
-
         source_t = torch.tensor(source_samples, dtype=torch.float32, device=self.device)
+
+        # Compute and store normalization parameters
+        self._source_mean = source_t.mean(dim=0, keepdim=True)
+        self._source_std = source_t.std(dim=0, keepdim=True).clamp(min=1e-6)
+
+        # Normalize source
+        source_norm = self._normalize(source_t)
 
         if target_samples is not None:
             target_t = torch.tensor(
                 target_samples, dtype=torch.float32, device=self.device
             )
         else:
-            target_t = None
+            target_t = None  # Will sample U(B_d) on the fly
 
-        # Phase 1: Train ICNN with Monge gap
-        history_icnn = self._train_icnn(source_t, target_t, verbose)
+        history_icnn = self._train_icnn(source_norm, target_t, verbose)
 
-        # Phase 2: Train amortized inverse
-        history_inverse = self._train_inverse(source_t, verbose)
+        # Post-hoc output normalization: find the scale so Q maps into B_d
+        # Use a margin (1.05) to ensure all training points are strictly inside
+        self.icnn.eval()
+        Q_all = self.icnn.gradient(source_norm, create_graph=False).detach()
+        max_norm = Q_all.norm(dim=1).max().item()
+        self._output_scale = max(max_norm * 1.05, 1e-6)  # small margin
+        self.icnn.train()
+
+        history_inverse = self._train_inverse(source_norm, verbose)
 
         return {"icnn_loss": history_icnn, "inverse_loss": history_inverse}
 
@@ -219,14 +311,21 @@ class NeuralOTMap:
         target: Optional[torch.Tensor],
         verbose: bool,
     ) -> list:
-        """Train the ICNN potential."""
+        """Train ICNN so that Q = nabla phi pushes source into U(B_d).
+
+        Loss = SW_2^2(Q(x_batch), y_batch)                   [distribution match]
+             + ball_penalty_weight * E[ReLU(||Q(x)||-1)^2]    [confine to B_d]
+
+        where y_batch ~ U(B_d) and SW_2^2 is the differentiable
+        Sliced Wasserstein distance.
+        """
+        d = source.shape[1]
         optimizer = torch.optim.Adam(
             self.icnn.parameters(),
             lr=self.lr_icnn,
             weight_decay=self.weight_decay,
         )
 
-        # Linear warmup scheduler
         def lr_lambda(epoch):
             if epoch < self.warmup_epochs:
                 return epoch / max(self.warmup_epochs, 1)
@@ -238,34 +337,37 @@ class NeuralOTMap:
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         losses = []
-        rng = range(self.n_epochs)
+        rng_iter = range(self.n_epochs)
         if verbose:
-            rng = trange(self.n_epochs, desc="ICNN training")
+            rng_iter = trange(self.n_epochs, desc="ICNN (SW -> B_d)")
 
-        for epoch in rng:
+        for epoch in rng_iter:
             epoch_loss = 0.0
             for (batch,) in loader:
                 optimizer.zero_grad()
+                bs = batch.shape[0]
 
-                # Forward map (create_graph=True for backprop to ICNN params)
-                Q_x = self.icnn.gradient(batch, create_graph=True)
+                # Forward OT map: Q(x) = nabla phi(x)
+                Q_x = self.icnn.gradient(batch, create_graph=True)  # (bs, d)
 
-                # Monge cost: E[||x - Q(x)||^2]
-                monge_cost = ((batch - Q_x) ** 2).sum(dim=1).mean()
-
-                # Regularizer: push Q(x) toward target distribution
+                # Target samples from U(B_d) or provided
                 if target is not None:
-                    idx = torch.randint(0, target.shape[0], (batch.shape[0],))
-                    target_batch = target[idx]
-                    target_loss = ((Q_x.mean(0) - target_batch.mean(0)) ** 2).sum()
+                    idx_t = torch.randint(0, target.shape[0], (bs,), device=self.device)
+                    y_batch = target[idx_t]
                 else:
-                    # Push toward standard normal
-                    target_loss = (
-                        ((Q_x.mean(0)) ** 2).sum()
-                        + ((Q_x.var(0) - 1.0) ** 2).sum()
-                    )
+                    y_batch = sample_uniform_ball(bs, d, self.device)
 
-                loss = monge_cost + self.monge_gap_weight * target_loss
+                # Sliced Wasserstein loss: match Q#mu to nu
+                sw_loss = differentiable_sliced_wasserstein(
+                    Q_x, y_batch, n_projections=50
+                )
+
+                # Ball confinement penalty
+                norms_Q = Q_x.norm(dim=1)
+                ball_violation = F.relu(norms_Q - 1.0)
+                ball_loss = (ball_violation ** 2).mean()
+
+                loss = sw_loss + self.ball_penalty_weight * ball_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -274,20 +376,36 @@ class NeuralOTMap:
                 optimizer.step()
                 scheduler.step()
 
-                epoch_loss += loss.item() * batch.shape[0]
+                epoch_loss += loss.item() * bs
 
             epoch_loss /= source.shape[0]
             losses.append(epoch_loss)
 
-            if verbose and isinstance(rng, trange):
-                rng.set_postfix(loss=f"{epoch_loss:.4f}")
+            if verbose and hasattr(rng_iter, 'set_postfix'):
+                with torch.no_grad():
+                    idx_s = torch.randint(0, source.shape[0], (min(200, source.shape[0]),))
+                    Q_s = self.icnn.gradient(source[idx_s])
+                    in_ball = (Q_s.norm(dim=1) <= 1.0).float().mean().item()
+                    mean_norm = Q_s.norm(dim=1).mean().item()
+                rng_iter.set_postfix(
+                    loss=f"{epoch_loss:.4f}",
+                    in_ball=f"{in_ball:.0%}",
+                    norm=f"{mean_norm:.2f}",
+                )
 
         return losses
 
     def _train_inverse(
         self, source: torch.Tensor, verbose: bool
     ) -> list:
-        """Train the amortized inverse map."""
+        """Train amortized inverse R_hat: B_d -> normalized residual space.
+
+        The inverse is trained in the post-hoc normalized space:
+        Q_scaled(x) = nabla phi(x) / output_scale, so that
+        R_hat(Q_scaled(x)) should reconstruct x.
+
+        Loss: E[||R_hat(Q_scaled(x)) - x||^2].
+        """
         optimizer = torch.optim.Adam(
             self.inverse.parameters(), lr=self.lr_inverse
         )
@@ -297,22 +415,22 @@ class NeuralOTMap:
 
         losses = []
         n_inverse_epochs = min(self.n_epochs, 200)
-        rng = range(n_inverse_epochs)
+        rng_iter = range(n_inverse_epochs)
         if verbose:
-            rng = trange(n_inverse_epochs, desc="Inverse training")
+            rng_iter = trange(n_inverse_epochs, desc="Inverse training")
 
         self.icnn.eval()
-        for epoch in rng:
+        for epoch in rng_iter:
             epoch_loss = 0.0
             for (batch,) in loader:
                 optimizer.zero_grad()
 
-                # Use create_graph=False (no backprop through ICNN needed)
-                # Cannot use torch.no_grad() because gradient() needs autograd
+                # Q_scaled in B_d
                 Q_x = self.icnn.gradient(batch, create_graph=False).detach()
+                Q_scaled = Q_x / self._output_scale
 
-                # Reconstruct: R(Q(x)) should be ≈ x
-                x_reconstructed = self.inverse(Q_x)
+                # Inverse maps from B_d back to normalized residual space
+                x_reconstructed = self.inverse(Q_scaled)
                 loss = ((x_reconstructed - batch) ** 2).sum(dim=1).mean()
 
                 loss.backward()
@@ -323,24 +441,29 @@ class NeuralOTMap:
             epoch_loss /= source.shape[0]
             losses.append(epoch_loss)
 
-            if verbose and isinstance(rng, trange):
-                rng.set_postfix(loss=f"{epoch_loss:.6f}")
+            if verbose and hasattr(rng_iter, 'set_postfix'):
+                rng_iter.set_postfix(loss=f"{epoch_loss:.6f}")
 
         self.icnn.train()
         return losses
 
+    # -----------------------------------------------------------------------
+    # Inference
+    # -----------------------------------------------------------------------
+
     def forward_map(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the forward OT map Q_hat."""
+        """Apply Q_hat = nabla phi(normalize(x)) / scale. Output in B_d."""
         self.icnn.eval()
-        result = self.icnn.gradient(x, create_graph=False).detach()
-        return result
+        x_norm = self._normalize(x)
+        result = self.icnn.gradient(x_norm, create_graph=False).detach()
+        return result / self._output_scale
 
     def inverse_map(self, y: torch.Tensor) -> torch.Tensor:
-        """Apply the inverse OT map R_hat."""
+        """Apply R_hat = denormalize(inverse(y * scale))."""
         self.inverse.eval()
         with torch.no_grad():
-            result = self.inverse(y)
-        return result
+            x_norm = self.inverse(y * self._output_scale)
+        return self._denormalize(x_norm)
 
     def forward_map_np(self, x: np.ndarray) -> np.ndarray:
         """Numpy wrapper for forward map."""
@@ -353,27 +476,43 @@ class NeuralOTMap:
         return self.inverse_map(y_t).cpu().numpy()
 
     def check_convexity(self, x: np.ndarray, n_checks: int = 100) -> float:
-        """Verify convexity of the ICNN potential along random line segments.
-
-        Returns the fraction of checks that satisfy convexity.
-        """
+        """Fraction of random line-segment checks satisfying convexity of phi."""
         self.icnn.eval()
         n = x.shape[0]
         violations = 0
 
         x_t = torch.tensor(x, dtype=torch.float32, device=self.device)
+        x_norm = self._normalize(x_t)
 
         with torch.no_grad():
             for _ in range(n_checks):
                 i, j = np.random.choice(n, 2, replace=False)
                 lam = np.random.uniform(0, 1)
-                x_mid = lam * x_t[i:i+1] + (1 - lam) * x_t[j:j+1]
+                x_mid = lam * x_norm[i:i+1] + (1 - lam) * x_norm[j:j+1]
 
-                phi_i = self.icnn(x_t[i:i+1]).item()
-                phi_j = self.icnn(x_t[j:j+1]).item()
+                phi_i = self.icnn(x_norm[i:i+1]).item()
+                phi_j = self.icnn(x_norm[j:j+1]).item()
                 phi_mid = self.icnn(x_mid).item()
 
                 if phi_mid > lam * phi_i + (1 - lam) * phi_j + 1e-6:
                     violations += 1
 
         return 1.0 - violations / n_checks
+
+    def ball_coverage(self, x: np.ndarray) -> float:
+        """Fraction of Q_hat(x) that lands inside B_d."""
+        Q = self.forward_map_np(x)
+        norms = np.linalg.norm(Q, axis=1)
+        return float(np.mean(norms <= 1.0))
+
+    def output_norm_stats(self, x: np.ndarray) -> Dict[str, float]:
+        """Statistics of ||Q_hat(x)|| for diagnostics."""
+        Q = self.forward_map_np(x)
+        norms = np.linalg.norm(Q, axis=1)
+        return {
+            "mean": float(norms.mean()),
+            "std": float(norms.std()),
+            "max": float(norms.max()),
+            "median": float(np.median(norms)),
+            "frac_in_ball": float(np.mean(norms <= 1.0)),
+        }

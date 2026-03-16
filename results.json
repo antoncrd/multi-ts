@@ -1,0 +1,52 @@
+{
+  "config": {
+    "d": 8,
+    "rho_A": 0.9,
+    "rho_cross": 0.3,
+    "k": 1000,
+    "alpha": 0.1,
+    "beta": 0.05,
+    "seed": 42,
+    "n_train": 1000,
+    "n_test": 500
+  },
+  "calibration": {
+    "rho_hat_k": 0.41261804014681613,
+    "eta_k": 0.6576720205593964,
+    "delta_star": 1.37174922219444,
+    "r_star_theory": 2.438766203705121,
+    "r_star_used": 0.7602322101593018,
+    "c_rho": 1.0,
+    "naive_radius": 3.8043180909047365
+  },
+  "metrics": {
+    "coverage": 0.912,
+    "coverage_gap": 0.01200000000000001,
+    "violation_rate": 0.08799999999999997,
+    "rolling_coverages": [
+      0.91,
+      0.92,
+      0.9,
+      0.91,
+      0.92
+    ],
+    "mean_log_volume": 66.88243103027344,
+    "mean_diameter": 1.5204641819000244,
+    "mean_winkler_log": 67.15034137539857,
+    "naive_coverage": 0.884
+  },
+  "diagnostics": {
+    "rank_min_pvalue": 1.0,
+    "rank_max_statistic": 0.0009990009712055326,
+    "norm_pvalue": 1.2856368149565425e-13
+  },
+  "ot_metrics": {
+    "icnn_final_loss": 39624318.408,
+    "inverse_final_loss": 0.008884418345987797,
+    "convexity_score": 1.0,
+    "norm_mean": 0.6210102438926697,
+    "norm_max": 1.0103996992111206,
+    "frac_in_ball": 0.999
+  },
+  "elapsed_seconds": 52.85108757019043
+}

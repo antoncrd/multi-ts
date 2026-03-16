@@ -81,11 +81,13 @@ def main(cfg: DictConfig) -> float:
     residuals_test = forecaster.residuals(X_test, Y_test)
 
     # --- 5. Train Neural OT map ---
-    # Must happen BEFORE calibration: the OT map Q_hat defines the rank
-    # transform R_hat(eps) = Q_hat(eps). The calibration step then computes
-    # W_1(mu_hat_k, U_d) on these OT-based ranks, not marginal ranks.
+    # Train on ALL training residuals (not just calib) for better estimation.
+    # The OT map Q_hat defines the rank transform; only the conformal
+    # calibration step requires the train/calib split.
+    residuals_train = forecaster.residuals(X_train, Y_train)
     ot_map = None
     ot_ranks = None  # Will hold Q_hat(residuals) normalized to [0,1]^d
+    ot_norms_calib = None  # ||Q_hat(residuals)|| for empirical OT calibration
     ot_metrics = {}
     device = "cuda" if cfg.device == "cuda" and _cuda_available() else "cpu"
 
@@ -102,21 +104,35 @@ def main(cfg: DictConfig) -> float:
             monge_gap_weight=cfg.model.monge_gap_weight,
             grad_clip=cfg.model.grad_clip,
             warmup_epochs=cfg.model.warmup_epochs,
+            strong_convexity=cfg.model.icnn.strong_convexity,
+            ball_penalty_weight=cfg.model.ball_penalty_weight,
+            n_conjugate_candidates=cfg.model.n_conjugate_candidates,
             device=device,
         )
-        train_hist = ot_map.fit(residuals_calib, verbose=False)
+        # Train on training residuals (more data than calib alone)
+        train_hist = ot_map.fit(residuals_train, verbose=False)
         convexity = ot_map.check_convexity(residuals_calib, n_checks=100)
+        norm_stats = ot_map.output_norm_stats(residuals_calib)
         ot_metrics = {
             "icnn_final_loss": train_hist["icnn_loss"][-1] if train_hist["icnn_loss"] else None,
             "inverse_final_loss": train_hist["inverse_loss"][-1] if train_hist["inverse_loss"] else None,
             "convexity_score": convexity,
+            "norm_mean": norm_stats["mean"],
+            "norm_max": norm_stats["max"],
+            "frac_in_ball": norm_stats["frac_in_ball"],
         }
-        log.info(f"OT map trained. Convexity: {convexity:.3f}")
+        log.info(
+            f"OT map trained. Convexity: {convexity:.3f}, "
+            f"in_ball: {norm_stats['frac_in_ball']:.1%}, "
+            f"norm_mean: {norm_stats['mean']:.3f}, norm_max: {norm_stats['max']:.3f}"
+        )
 
-        # Compute OT-based ranks: apply Q_hat then normalize to [0,1]^d
-        # via marginal rank transform of the OT-mapped residuals.
+        # Compute OT-based ranks (for W_1 diagnostics)
         ot_mapped = ot_map.forward_map_np(residuals_calib)
         ot_ranks = rank_transform(ot_mapped)
+
+        # OT norms for empirical calibration
+        ot_norms_calib = np.linalg.norm(ot_mapped, axis=1)
 
     except Exception as e:
         log.warning(f"Neural OT training failed: {e}. Falling back to marginal ranks.")
@@ -127,27 +143,44 @@ def main(cfg: DictConfig) -> float:
     unif_test = uniformity_test(ranks)
     rank_ks = rank_uniformity_ks(ranks)
 
-    # --- 7. Conformal calibration (uses OT ranks when available) ---
+    # --- 7. Conformal calibration ---
     calibrator = ConformalCalibrator(
         alpha=alpha,
         beta=beta,
         w1_method=cfg.conformal.w1_method,
         w1_n_projections=cfg.conformal.w1_n_projections,
     )
+
+    # Theoretical calibration (W_1 bound + concentration)
     cal_result = calibrator.calibrate(
         residuals_calib, seed=cfg.seed, ot_ranks=ot_ranks,
     )
 
+    # Empirical calibration in OT space (quantile of ||Q_hat(residual)||)
+    # This is the primary radius used for containment, since it is
+    # consistent with the test-time check ||Q_hat(Y - Y_hat)|| <= r*.
+    if ot_map is not None and ot_norms_calib is not None:
+        r_star_empirical = calibrator.calibrate_empirical_ot(ot_norms_calib)
+        r_star = r_star_empirical
+    else:
+        r_star = cal_result.r_star
+
     log.info(
         f"Calibration: rho_hat={cal_result.rho_hat_k:.4f}, "
         f"eta_k={cal_result.eta_k:.4f}, "
-        f"r*={cal_result.r_star:.4f}"
+        f"r*_theory={cal_result.r_star:.4f}, "
+        f"r*_used={r_star:.4f}"
     )
 
     # --- 8. Build prediction regions ---
     Y_hat_test = forecaster.predict(X_test)
-    ot_inverse_fn = ot_map.inverse_map if ot_map is not None else None
-    regions = build_regions_batch(Y_hat_test, cal_result.r_star, ot_inverse_fn)
+    ot_forward_fn = ot_map.forward_map_np if ot_map is not None else None
+    ot_inverse_fn = ot_map.inverse_map_np if ot_map is not None else None
+    regions = build_regions_batch(
+        Y_hat_test, r_star,
+        ot_forward=ot_forward_fn,
+        ot_inverse=ot_inverse_fn,
+    )
 
     # --- 9. Evaluate metrics ---
     cov = marginal_coverage(regions, Y_test)
@@ -158,9 +191,9 @@ def main(cfg: DictConfig) -> float:
     avg_diam = mean_diameter(regions)
     avg_winkler_log = mean_winkler_log(regions, Y_test, alpha)
 
-    # Naive baseline (no OT correction)
+    # Naive baseline (no OT correction) — uses Euclidean ball in residual space
     naive_radius = calibrator.calibrate_naive(residuals_calib)
-    naive_regions = build_regions_batch(Y_hat_test, naive_radius)
+    naive_regions = build_regions_batch(Y_hat_test, naive_radius)  # no OT maps
     naive_cov = marginal_coverage(naive_regions, Y_test)
 
     elapsed = time.time() - t0
@@ -182,7 +215,8 @@ def main(cfg: DictConfig) -> float:
             "rho_hat_k": float(cal_result.rho_hat_k),
             "eta_k": float(cal_result.eta_k),
             "delta_star": float(cal_result.delta_star),
-            "r_star": float(cal_result.r_star),
+            "r_star_theory": float(cal_result.r_star),
+            "r_star_used": float(r_star),
             "c_rho": float(cal_result.c_rho),
             "naive_radius": float(naive_radius),
         },

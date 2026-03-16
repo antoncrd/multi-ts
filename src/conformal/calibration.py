@@ -146,19 +146,33 @@ class ConformalCalibrator:
     ) -> float:
         """Compute concentration bound eta_k(beta).
 
-        eta_k(beta) = (C / beta) * (a_d(k) + k^{-(q-1)/q})
+        Uses a two-part bound combining:
+        1. Expected rate: kappa * a_d(k), the Fournier-Guillin rate term
+        2. Concentration: McDiarmid's inequality applied to W_1.
 
-        where:
-        - C = kappa_{d,1} * C_rho (Fournier constant times mixing factor)
-        - a_d(k) is the dimension-dependent rate term
-        - q is the moment parameter
+        Since W_1 has bounded differences (changing one sample out of k
+        changes W_1 by at most diam(support)/k = sqrt(d)/k on [0,1]^d),
+        McDiarmid gives:
+            P(W_1 > E[W_1] + t) <= exp(-2 k t^2 / d)
+
+        Setting this to beta and solving for t:
+            t = sqrt(d * log(1/beta) / (2k))
+
+        The full bound is:
+            eta_k(beta) = c_rho * (kappa * a_d(k) + sqrt(d * log(1/beta) / (2k)))
+
+        where c_rho accounts for temporal dependence (rho-mixing).
         """
         kappa = fournier_constant(d)
-        C = kappa * c_rho
         a_d_k = convergence_rate_term(k, d)
-        moment_term = k ** (-(self.q - 1) / self.q)
 
-        return (C / beta) * (a_d_k + moment_term)
+        # Part 1: Expected rate (Fournier-Guillin)
+        expected_rate = kappa * a_d_k
+
+        # Part 2: McDiarmid concentration tail
+        concentration = np.sqrt(d * np.log(1.0 / beta) / (2.0 * k))
+
+        return c_rho * (expected_rate + concentration)
 
     @staticmethod
     def optimize_delta_star(r: float, d: int, A: float) -> float:
@@ -251,6 +265,28 @@ class ConformalCalibrator:
         k = residuals.shape[0]
         norms = np.linalg.norm(residuals, axis=1)
         norms_sorted = np.sort(norms)
+        idx = int(np.ceil((1 - self.alpha) * (k + 1))) - 1
+        idx = min(idx, k - 1)
+        return norms_sorted[idx]
+
+    def calibrate_empirical_ot(self, ot_norms: np.ndarray) -> float:
+        """Empirical conformal quantile in OT rank space.
+
+        Given ||Q_hat(residual_i)|| for i in calibration set,
+        returns the (1-alpha)-quantile. This is used at test time with
+        ||Q_hat(Y_t - Y_hat_t)|| <= r* for containment.
+
+        This bypasses the theoretical W_1 bound and directly uses the
+        empirical quantile of OT-mapped norms.
+
+        Args:
+            ot_norms: shape (k,), norms of Q_hat(residuals) in rank space.
+
+        Returns:
+            Empirical conformal radius in OT space.
+        """
+        k = len(ot_norms)
+        norms_sorted = np.sort(ot_norms)
         idx = int(np.ceil((1 - self.alpha) * (k + 1))) - 1
         idx = min(idx, k - 1)
         return norms_sorted[idx]
