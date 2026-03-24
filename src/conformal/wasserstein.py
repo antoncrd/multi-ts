@@ -32,6 +32,20 @@ def rank_transform(residuals: np.ndarray) -> np.ndarray:
     return ranks
 
 
+def _sample_uniform_ball(n: int, d: int, rng: np.random.Generator) -> np.ndarray:
+    """Sample n points uniformly from the d-dimensional unit ball B_d(0,1).
+
+    Method: sample direction uniformly on S^{d-1}, then radius r ~ U^{1/d}.
+    """
+    z = rng.standard_normal((n, d))
+    norms = np.linalg.norm(z, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    z = z / norms
+    u = rng.uniform(0, 1, size=(n, 1))
+    r = u ** (1.0 / d)
+    return r * z
+
+
 def wasserstein_1_uniform(
     samples: np.ndarray,
     d: int,
@@ -40,17 +54,17 @@ def wasserstein_1_uniform(
     n_reference: int = 5000,
     seed: Optional[int] = None,
 ) -> float:
-    """Compute W_1(mu_hat, U_d) between empirical measure and uniform on [0,1]^d.
+    """Compute W_1(mu_hat, U(B_d)) between empirical measure and uniform on the unit ball.
 
     Args:
         samples: shape (k, d), empirical samples (typically rank-transformed).
         d: dimension (must match samples.shape[1]).
         method: "exact", "sliced", or "auto".
-            - "exact": POT emd2 against reference samples from U_d.
+            - "exact": POT emd2 against reference samples from U(B_d).
             - "sliced": sliced Wasserstein distance with random projections.
             - "auto": exact if d <= 8 and k <= 2000, sliced otherwise.
         n_projections: Number of projections for sliced method.
-        n_reference: Number of reference samples from U_d for exact method.
+        n_reference: Number of reference samples from U(B_d) for exact method.
         seed: Random seed for reference sampling.
 
     Returns:
@@ -78,9 +92,9 @@ def _w1_exact(
     n_reference: int,
     rng: np.random.Generator,
 ) -> float:
-    """Exact W1 via POT emd2 against uniform reference samples."""
+    """Exact W1 via POT emd2 against uniform reference samples on B_d."""
     k = samples.shape[0]
-    reference = rng.uniform(0, 1, size=(n_reference, d))
+    reference = _sample_uniform_ball(n_reference, d, rng)
 
     # Uniform weights
     a = np.ones(k) / k
@@ -98,10 +112,10 @@ def _w1_sliced(
     n_projections: int,
     rng: np.random.Generator,
 ) -> float:
-    """Sliced Wasserstein distance against uniform on [0,1]^d."""
+    """Sliced Wasserstein distance against uniform on B_d."""
     k = samples.shape[0]
     n_ref = max(k, 2000)  # Use a large reference set for stable estimates
-    reference = rng.uniform(0, 1, size=(n_ref, d))
+    reference = _sample_uniform_ball(n_ref, d, rng)
 
     return ot.sliced_wasserstein_distance(
         samples, reference, n_projections=n_projections, seed=int(rng.integers(2**31))
@@ -109,14 +123,11 @@ def _w1_sliced(
 
 
 def fournier_constant(d: int, m: int = 1) -> float:
-    """Fournier & Guillin (2015) constant kappa^(m)_{d,1} for W_1 convergence.
+    """Fournier (2023) constant kappa^(m)_{d,1} for W_1 convergence.
 
-    For the uniform distribution on [0,1]^d (bounded support with diameter
-    sqrt(d)), the expected W_1 satisfies:
-        E[W_1(mu_n, U_d)] <= kappa * n^{-1/max(d,2)}  (times log factor if d=2)
-
-    We use tight constants calibrated for U([0,1]^d) rather than the
-    worst-case constants from the general theorem.
+    Values from Fournier (2023) Table 1 (d <= 9) and Table 3 (d >= 10).
+    For dimensions not in the table, values are linearly interpolated
+    between the nearest available entries.
 
     Args:
         d: dimension.
@@ -125,28 +136,29 @@ def fournier_constant(d: int, m: int = 1) -> float:
     Returns:
         The constant kappa^(m)_{d,1}.
     """
-    # Tight constants for uniform on [0,1]^d, calibrated empirically
-    # and consistent with Fournier & Guillin (2015) Table 1.
-    # For bounded support on [0,1]^d, the constants are much smaller
-    # than the general-case bounds (which hold for any distribution
-    # with bounded p-th moment).
     table = {
-        1: 0.5,
-        2: 0.7,
-        3: 0.8,
-        4: 0.9,
-        5: 1.0,
-        6: 1.1,
-        8: 1.3,
-        16: 1.8,
-        32: 2.5,
-        64: 3.5,
+        1: 2.42, 2: 0.73, 3: 3.72, 4: 2.45, 5: 2.09,
+        6: 1.94, 7: 1.87, 8: 1.84, 9: 1.82,
+        # Optimized bounds for larger d (Table 3)
+        10: 8.91, 12: 7.67, 15: 6.74, 16: 6.50, 20: 6.00,
+        25: 5.60, 32: 5.25, 35: 5.17, 50: 4.85, 64: 4.65,
+        75: 4.60, 100: 4.47, 500: 4.12,
     }
     if d in table:
         return table[d]
 
-    # Extrapolate: kappa grows roughly as sqrt(d) for bounded support
-    return 0.4 * np.sqrt(d)
+    # Interpolate between nearest keys
+    keys = sorted(table.keys())
+    if d < keys[0]:
+        return table[keys[0]]
+    if d > keys[-1]:
+        return table[keys[-1]]
+    lo = max(k for k in keys if k <= d)
+    hi = min(k for k in keys if k >= d)
+    if lo == hi:
+        return table[lo]
+    frac = (d - lo) / (hi - lo)
+    return table[lo] * (1 - frac) + table[hi] * frac
 
 
 def convergence_rate_term(k: int, d: int) -> float:
@@ -171,6 +183,7 @@ def estimate_mixing_factor(
 
     Uses the norm of rank vectors ||R(eps_t)|| as a 1D summary,
     then sums the absolute autocorrelations up to max_lag.
+    C_rho = rho_0 + 2 * sum_{n>=1} |rho_n|.
 
     Args:
         ranks: shape (n, d), rank-transformed residuals.
@@ -192,7 +205,7 @@ def estimate_mixing_factor(
         rho_lag = autocov / var
         if abs(rho_lag) < 2.0 / np.sqrt(n):
             break  # Insignificant autocorrelation
-        c_rho += abs(rho_lag)
+        c_rho += 2.0 * abs(rho_lag)  # factor of 2 for symmetric pairs (i,s) and (s,i)
 
     return c_rho
 

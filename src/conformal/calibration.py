@@ -1,10 +1,10 @@
 """Conformal calibration engine.
 
 Implements the full calibration pipeline:
-- rho_hat_k = W_1(mu_hat_k, U_d) from rank-transformed residuals
-- eta_k(beta) = (C/beta) * (a_d(k) + k^{-(q-1)/q}) with explicit Fournier constants
-- delta* optimization via 1D search
-- r*(alpha, beta) = delta* + (1 - alpha + A/delta*)^{1/d}
+- rho_hat_k = W_1(mu_hat_k, U(B_d)) from rank-transformed residuals
+- eta_k(beta) = (1/beta) * (2 * kappa_{d,1} * C_rho^{1/d}) / k^{1/d}
+- delta*(r) via FOC bisection: d * delta^2 * (r - delta)^{d-1} = A
+- r*(alpha, beta) via nested bisection on L*(r) >= 1 - alpha
 """
 
 import warnings
@@ -12,10 +12,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from scipy.optimize import minimize_scalar
+from scipy.optimize import brentq
 
 from src.conformal.wasserstein import (
-    convergence_rate_term,
     estimate_mixing_factor,
     fournier_constant,
     rank_transform,
@@ -31,6 +30,7 @@ class CalibrationResult:
     eta_k: float           # Concentration bound eta_k(beta)
     delta_star: float      # Optimal smoothing parameter
     r_star: float          # Final conformal radius r*(alpha, beta)
+    r_star_uncapped: float # r* before clipping to 1.0
     alpha: float           # Target miscoverage level
     beta: float            # Confidence parameter for W_1 bound
     d: int                 # Dimension
@@ -55,7 +55,6 @@ class ConformalCalibrator:
         beta: float = 0.05,
         w1_method: str = "auto",
         w1_n_projections: int = 100,
-        q: float = 2.0,
     ):
         """
         Args:
@@ -63,7 +62,6 @@ class ConformalCalibrator:
             beta: Confidence parameter for Wasserstein bound.
             w1_method: Method for W_1 computation ("exact", "sliced", "auto").
             w1_n_projections: Number of projections for sliced W_1.
-            q: Moment parameter for concentration inequality (q > 1).
         """
         if not 0 < alpha < 1:
             raise ValueError(f"alpha must be in (0, 1), got {alpha}")
@@ -74,7 +72,6 @@ class ConformalCalibrator:
         self.beta = beta
         self.w1_method = w1_method
         self.w1_n_projections = w1_n_projections
-        self.q = q
 
     def calibrate(
         self,
@@ -103,7 +100,7 @@ class ConformalCalibrator:
         else:
             ranks = rank_transform(residuals)
 
-        # Step 2: Compute W_1(mu_hat_k, U_d)
+        # Step 2: Compute W_1(mu_hat_k, U(B_d))
         rho_hat_k = wasserstein_1_uniform(
             ranks, d,
             method=self.w1_method,
@@ -118,22 +115,17 @@ class ConformalCalibrator:
         eta_k = self.compute_eta_k(self.beta, k, d, c_rho)
 
         # Step 5: Effective Wasserstein bound
-        # A = rho_hat_k + eta_k is the upper bound on the true W_1
         A = rho_hat_k + eta_k
 
-        # Step 6: Optimize delta*
-        # We need a preliminary radius estimate to set the search range
-        r_prelim = (1 - self.alpha) ** (1.0 / d) + A
-        delta_star = self.optimize_delta_star(r_prelim, d, A)
-
-        # Step 7: Compute r*(alpha, beta)
-        r_star = self.compute_radius(self.alpha, delta_star, A, d)
+        # Step 6: Nested bisection for r*(alpha, beta)
+        r_star, delta_star, r_star_uncapped = self._nested_bisection(self.alpha, d, A)
 
         return CalibrationResult(
             rho_hat_k=rho_hat_k,
             eta_k=eta_k,
             delta_star=delta_star,
             r_star=r_star,
+            r_star_uncapped=r_star_uncapped,
             alpha=self.alpha,
             beta=self.beta,
             d=d,
@@ -141,98 +133,138 @@ class ConformalCalibrator:
             c_rho=c_rho,
         )
 
+    @staticmethod
+    def _nested_bisection(alpha: float, d: int, A: float) -> tuple:
+        """Find r*(alpha, beta) via nested bisection over r in (0, 1].
+
+        Outer bisection on r: find smallest r with L*(r) >= 1 - alpha,
+        where L*(r) = (r - delta*(r))^d - A / delta*(r).
+        Inner bisection: solve FOC for delta*(r).
+
+        Since ranks live in B_d, r is restricted to (0, 1].
+        If no valid r exists (bound is vacuous), returns r=1.
+
+        Returns:
+            (r_star, delta_star) tuple.
+        """
+        def L_star(r):
+            if r <= 0:
+                return -float("inf")
+            ds = ConformalCalibrator.optimize_delta_star(r, d, A)
+            if ds <= 0 or ds >= r:
+                return -float("inf")
+            return (r - ds) ** d - A / ds
+
+        # Ranks live in B_d, so r ∈ (0, 1]
+        r_upper = 1.0
+
+        # First, find the uncapped r* (no upper-bound restriction)
+        # to report the true theoretical radius before clipping.
+        r_uncapped_hi = max(r_upper, 10.0)
+        while L_star(r_uncapped_hi) < 1 - alpha and r_uncapped_hi < 1e6:
+            r_uncapped_hi *= 2.0
+        if L_star(r_uncapped_hi) >= 1 - alpha:
+            r_lo_u, r_hi_u = 1e-6, r_uncapped_hi
+            for _ in range(100):
+                r_mid = (r_lo_u + r_hi_u) / 2
+                if L_star(r_mid) >= 1 - alpha:
+                    r_hi_u = r_mid
+                else:
+                    r_lo_u = r_mid
+                if r_hi_u - r_lo_u < 1e-10:
+                    break
+            r_star_uncapped = r_hi_u
+        else:
+            r_star_uncapped = float("inf")
+        print(f"  [calibration] r*_uncapped = {r_star_uncapped:.6f}  (before clipping to 1.0)")
+
+        if L_star(r_upper) < 1 - alpha:
+            # Bound is vacuous: not enough data for the theoretical
+            # guarantee at this (alpha, beta, k, d).
+            warnings.warn(
+                f"Bound is vacuous (A={A:.4f}, d={d}): L*(1) < 1-alpha. "
+                f"Returning r*=1. Increase k or relax beta."
+            )
+            r_star = 1.0
+            delta_star = ConformalCalibrator.optimize_delta_star(r_star, d, A)
+        else:
+            r_lo, r_hi = 1e-6, r_upper
+            for _ in range(100):
+                r_mid = (r_lo + r_hi) / 2
+                if L_star(r_mid) >= 1 - alpha:
+                    r_hi = r_mid
+                else:
+                    r_lo = r_mid
+                if r_hi - r_lo < 1e-10:
+                    break
+            r_star = r_hi
+            delta_star = ConformalCalibrator.optimize_delta_star(r_star, d, A)
+
+        return r_star, delta_star, r_star_uncapped
+
     def compute_eta_k(
         self, beta: float, k: int, d: int, c_rho: float = 1.0
     ) -> float:
         """Compute concentration bound eta_k(beta).
 
-        Uses a two-part bound combining:
-        1. Expected rate: kappa * a_d(k), the Fournier-Guillin rate term
-        2. Concentration: McDiarmid's inequality applied to W_1.
+        eta_k(beta) = log(1/beta) * (2 * kappa_{d,1} * C_rho^{1/d}) / k^{1/d}
 
-        Since W_1 has bounded differences (changing one sample out of k
-        changes W_1 by at most diam(support)/k = sqrt(d)/k on [0,1]^d),
-        McDiarmid gives:
-            P(W_1 > E[W_1] + t) <= exp(-2 k t^2 / d)
-
-        Setting this to beta and solving for t:
-            t = sqrt(d * log(1/beta) / (2k))
-
-        The full bound is:
-            eta_k(beta) = c_rho * (kappa * a_d(k) + sqrt(d * log(1/beta) / (2k)))
-
-        where c_rho accounts for temporal dependence (rho-mixing).
+        Uses the Fournier (2023) explicit expectation bound with a
+        log(1/beta) concentration factor (conjectured tighter than Markov).
         """
         kappa = fournier_constant(d)
-        a_d_k = convergence_rate_term(k, d)
-
-        # Part 1: Expected rate (Fournier-Guillin)
-        expected_rate = kappa * a_d_k
-
-        # Part 2: McDiarmid concentration tail
-        concentration = np.sqrt(d * np.log(1.0 / beta) / (2.0 * k))
-
-        return c_rho * (expected_rate + concentration)
+        return np.log(1.0 / beta) * (2.0 * kappa * c_rho ** (1.0 / d)) / (k ** (1.0 / d))
 
     @staticmethod
     def optimize_delta_star(r: float, d: int, A: float) -> float:
-        """Optimize delta* via 1D search.
+        """Find delta*(r) by solving the FOC via bisection.
 
-        Minimizes L(delta) = (r - delta)^d - A / delta on (0, r).
-        The optimal delta balances the volume loss from shrinking the ball
-        against the Wasserstein correction.
+        Solves: d * delta^2 * (r - delta)^{d-1} = A
+        for the LEFT root in (0, 2r/(d+1)), which maximizes L(delta).
 
         Args:
-            r: Preliminary radius.
+            r: Radius.
             d: Dimension.
             A: Wasserstein upper bound (rho_hat + eta).
 
         Returns:
             Optimal delta*.
         """
-        if A <= 0:
+        if A <= 0 or r <= 0:
             return 0.0
 
         eps = 1e-10
 
-        def objective(delta):
-            if delta <= eps or delta >= r - eps:
-                return np.inf
-            return (r - delta) ** d - A / delta
+        def foc(delta):
+            return d * delta ** 2 * (r - delta) ** (d - 1) - A
 
-        # Check if a valid interior minimum exists
-        # At delta -> 0+: L -> -inf (from -A/delta term)
-        # At delta -> r-: L -> -A/r (from (r-delta)^d -> 0)
-        # We want the minimum, which may be at the boundary
-        # The derivative: -d*(r-delta)^{d-1} + A/delta^2 = 0
-        # => A/delta^2 = d*(r-delta)^{d-1}
+        # g(delta) = d*delta^2*(r-delta)^{d-1} peaks at delta = 2r/(d+1)
+        delta_peak = 2.0 * r / (d + 1)
 
+        if foc(delta_peak) < 0:
+            # g never reaches A — no root exists; return peak as best approx
+            return delta_peak
+
+        # Left root in (eps, delta_peak) is the L-maximizer
         try:
-            result = minimize_scalar(
-                objective,
-                bounds=(eps, r - eps),
-                method="bounded",
-                options={"xatol": 1e-12, "maxiter": 1000},
-            )
-            if result.success and eps < result.x < r - eps:
-                return result.x
+            return brentq(foc, eps, delta_peak, xtol=1e-12, maxiter=200)
         except Exception:
-            pass
-
-        # Fallback: delta = r/2 with warning
-        warnings.warn(
-            f"delta* optimization failed (r={r:.4f}, d={d}, A={A:.6f}). "
-            f"Using fallback delta* = r/2."
-        )
-        return r / 2.0
+            warnings.warn(
+                f"delta* optimization failed (r={r:.4f}, d={d}, A={A:.6f}). "
+                f"Using fallback delta* = 2r/(d+1)."
+            )
+            return delta_peak
 
     @staticmethod
     def compute_radius(
         alpha: float, delta_star: float, A: float, d: int
     ) -> float:
-        """Compute conformal radius r*(alpha, beta).
+        """Compute conservative upper bound on conformal radius.
 
-        r*(alpha, beta) = delta* + (1 - alpha + A/delta*)^{1/d}
+        r_upper(alpha, beta) = delta* + (1 - alpha + A/delta*)^{1/d}
+
+        This is a closed-form conservative bound. The primary method
+        uses nested bisection in calibrate().
 
         Args:
             alpha: Miscoverage level.
@@ -241,7 +273,7 @@ class ConformalCalibrator:
             d: Dimension.
 
         Returns:
-            Conformal radius r*.
+            Conservative conformal radius.
         """
         if delta_star <= 0:
             # No OT correction: standard conformal quantile
@@ -255,7 +287,7 @@ class ConformalCalibrator:
             )
             inner = 1e-10
 
-        return delta_star + inner ** (1.0 / d)
+        return min(delta_star + inner ** (1.0 / d), 1.0)
 
     def calibrate_naive(self, residuals: np.ndarray) -> float:
         """Naive conformal quantile (no OT correction) for comparison.

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/run_neural_ot_conformal.py --dataset exchange --d 4 --n_windows 1 --joint_epochs 100 --ot_epochs 100 --device cpu)",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest tests/test_calibration.py::TestConformalCalibrator::test_end_to_end_coverage -v --tb=long)"
+    ]
+  }
+}

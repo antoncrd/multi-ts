@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from src.conformal.wasserstein import (
+    _sample_uniform_ball,
     convergence_rate_term,
     fournier_constant,
     rank_transform,
@@ -38,9 +39,9 @@ class TestRankTransform:
 
 class TestWasserstein:
     def test_identical_distributions(self):
-        """W1 between identical distributions should be ~0."""
+        """W1 between samples from U(B_d) and U(B_d) should be ~0."""
         rng = np.random.default_rng(42)
-        samples = rng.uniform(0, 1, size=(500, 4))
+        samples = _sample_uniform_ball(500, 4, rng)
         w1 = wasserstein_1_uniform(samples, d=4, method="sliced", seed=42)
         # Should be small but not exactly 0 (finite sample)
         assert w1 < 0.2
@@ -50,7 +51,7 @@ class TestWasserstein:
         w1_values = []
         for n in [100, 500, 2000]:
             rng = np.random.default_rng(n)  # Independent seed per size
-            samples = rng.uniform(0, 1, size=(n, 4))
+            samples = _sample_uniform_ball(n, 4, rng)
             w1 = wasserstein_1_uniform(samples, d=4, method="sliced", seed=n)
             w1_values.append(w1)
         # Generally decreasing (allow some noise)
@@ -59,7 +60,7 @@ class TestWasserstein:
     def test_exact_method(self):
         """Exact method should give a result for small d and k."""
         rng = np.random.default_rng(42)
-        samples = rng.uniform(0, 1, size=(100, 2))
+        samples = _sample_uniform_ball(100, 2, rng)
         w1 = wasserstein_1_uniform(samples, d=2, method="exact", seed=42)
         assert w1 >= 0
         assert w1 < 1.0
@@ -68,12 +69,12 @@ class TestWasserstein:
         """Auto should use exact for small d/k, sliced for large."""
         rng = np.random.default_rng(42)
         # Small: d=2, k=100 -> should use exact
-        small = rng.uniform(0, 1, size=(100, 2))
+        small = _sample_uniform_ball(100, 2, rng)
         w1_small = wasserstein_1_uniform(small, d=2, method="auto", seed=42)
         assert w1_small >= 0
 
         # Large: d=16, k=3000 -> should use sliced
-        large = rng.uniform(0, 1, size=(3000, 16))
+        large = _sample_uniform_ball(3000, 16, rng)
         w1_large = wasserstein_1_uniform(large, d=16, method="auto", seed=42)
         assert w1_large >= 0
 
